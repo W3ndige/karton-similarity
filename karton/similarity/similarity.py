@@ -6,11 +6,6 @@ from typing import Dict, Optional, List
 from karton.core import Karton, Task, Config
 
 
-def get_minhash_types(url: str) -> List[str]:
-    r = requests.get(f"{url}/minhash/types")
-    return r.json()
-
-
 def get_minhashes(url: str, type: Optional[str] = None) -> Dict:
     if type:
         r = requests.get(f"{url}/minhash/?minhash_type={type}")
@@ -69,21 +64,8 @@ class Similarity(Karton):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        minhash_types = get_minhash_types(self.config.aurora_config["url"])
+        self.minhash_lsh_dict = {}
 
-        self.log.info(f"Available minhash types: {minhash_types}")
-
-        self.minhash_lsh_dict = dict.fromkeys(minhash_types, None)
-        for minhash_type in minhash_types:
-            self.minhash_lsh_dict[minhash_type] = datasketch.MinHashLSH(
-                threshold=0.5,
-                num_perm=256,
-                storage_config={
-                    "type": "redis",
-                    "basename": minhash_type.encode("UTF-8"),
-                    "redis": {"host": "redis", "port": 6379},
-                },
-            )
 
     def process(self, task: Task) -> None:
         if task.headers["stage"] == "minhash":
@@ -95,9 +77,11 @@ class Similarity(Karton):
         sha256 = task.get_payload("sha256")
         seed = task.get_payload("seed")
         hash_values = task.get_payload("hash_values")
-        minhash_type = task.headers["kind"].upper()
+        minhash_type = task.headers["kind"]
 
         minhash = datasketch.LeanMinHash(seed=seed, hashvalues=hash_values)
+        if minhash_type not in self.minhash_lsh_dict.keys():
+            self.add_minhash_lsh(minhash_type)
 
         try:
             self.minhash_lsh_dict[minhash_type].insert(sha256, minhash)
@@ -125,9 +109,20 @@ class Similarity(Karton):
                     self.config.aurora_config["url"],
                     sha256,
                     db_minhash["sample"]["sha256"],
-                    f"{minhash_type}_MINHASH",
+                    minhash_type,
                     jaccard_coefficient,
                 )
+
+    def add_minhash_lsh(self, minhash_type: str) -> None:
+        self.minhash_lsh_dict[minhash_type] = datasketch.MinHashLSH(
+            threshold=0.5,
+            num_perm=256,
+            storage_config={
+                "type": "redis",
+                "basename": minhash_type.encode("UTF-8"),
+                "redis": {"host": "redis", "port": 6379},
+            }
+        )
 
     def process_ssdeep(self, task: Task) -> None:
         sha256 = task.get_payload("sha256")
@@ -151,6 +146,6 @@ class Similarity(Karton):
                     self.config.aurora_config["url"],
                     sha256,
                     ssdeep_data["sample"]["sha256"],
-                    "SSDEEP",
+                    "ssdeep",
                     ssdeep_coefficient,
                 )
