@@ -2,44 +2,8 @@ import ssdeep
 import requests
 import datasketch
 
-from typing import Dict, Optional, List
+from typing import Dict, List, Any
 from karton.core import Karton, Task, Config
-
-
-def get_minhashes(url: str, type: Optional[str] = None) -> Dict:
-    if type:
-        r = requests.get(f"{url}/minhash/?minhash_type={type}")
-    else:
-        r = requests.get(f"{url}/minhash/")
-
-    return r.json()
-
-
-def get_ssdeep_hashes(url: str, chunksize: int) -> Dict:
-    r = requests.get(f"{url}/ssdeep/?chunksize={chunksize}")
-
-    return r.json()
-
-
-def get_sample_minhash(url: str, sha256: str, minhash_type: str) -> Dict:
-    r = requests.get(f"{url}/sample/{sha256}/minhash?minhash_type={minhash_type}")
-    return r.json()
-
-
-def post_relation(
-    url: str, this_sha256: str, other_sha256: str, type: str, confidence: str
-) -> Dict:
-    r = requests.post(
-        f"{url}/relation/",
-        json={
-            "parent_sha256": this_sha256,
-            "child_sha256": other_sha256,
-            "type": type,
-            "confidence": confidence,
-        },
-    )
-
-    return r.json()
 
 
 class AuroraConfig(Config):
@@ -51,21 +15,14 @@ class AuroraConfig(Config):
 class Similarity(Karton):
     identity = "karton.similarity"
     filters = [
-        {
-            "type": "feature",
-            "stage": "minhash"
-        },
-        {
-            "type": "feature",
-            "stage": "ssdeep"
-        }
+        {"type": "feature", "stage": "minhash"},
+        {"type": "feature", "stage": "ssdeep"},
     ]
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
         self.minhash_lsh_dict = {}
-
 
     def process(self, task: Task) -> None:
         if task.headers["stage"] == "minhash":
@@ -90,27 +47,38 @@ class Similarity(Karton):
 
         lsh_sha256_list = self.minhash_lsh_dict[minhash_type].query(minhash)
 
-        for sample_sha256 in lsh_sha256_list:
+        self.process_minhash_candidates(
+            sha256, minhash, lsh_sha256_list, minhash_type
+        )
 
-            if sample_sha256 == sha256:
+    def process_minhash_candidates(
+        self,
+        sample_sha256: str,
+        sample_minhash: datasketch.LeanMinHash,
+        candidates_sha256: List[str],
+        minhash_type: str,
+    ) -> None:
+
+        for candidate_sha256 in candidates_sha256:
+            if candidate_sha256 == sample_sha256:
                 continue
 
-            db_minhash = get_sample_minhash(
-                self.config.aurora_config["url"], sample_sha256, minhash_type
+            candidate_minhash_info = self.get_sample_minhash(
+                candidate_sha256, minhash_type
             )[0]
 
-            db_lean_minhash = datasketch.LeanMinHash(
-                seed=db_minhash["seed"], hashvalues=db_minhash["hash_values"]
+            candidate_minhash = datasketch.LeanMinHash(
+                seed=candidate_minhash_info["seed"],
+                hashvalues=candidate_minhash_info["hash_values"],
             )
 
-            jaccard_coefficient = minhash.jaccard(db_lean_minhash)
+            jaccard_coefficient = sample_minhash.jaccard(candidate_minhash)
             if jaccard_coefficient > 0.5:
-                post_relation(
-                    self.config.aurora_config["url"],
-                    sha256,
-                    db_minhash["sample"]["sha256"],
-                    minhash_type,
+                self.add_relation(
+                    sample_sha256,
+                    candidate_sha256,
                     jaccard_coefficient,
+                    minhash_type,
                 )
 
     def add_minhash_lsh(self, minhash_type: str) -> None:
@@ -121,17 +89,48 @@ class Similarity(Karton):
                 "type": "redis",
                 "basename": minhash_type.encode("UTF-8"),
                 "redis": {"host": "redis", "port": 6379},
-            }
+            },
         )
+
+    def add_relation(
+        self,
+        sample_sha256: str,
+        related_sha256: str,
+        confidence: float,
+        relation_type: str,
+    ) -> None:
+        relation_payload = {
+            "parent_sha256": sample_sha256,
+            "child_sha256": related_sha256,
+            "type": relation_type,
+            "confidence": confidence,
+        }
+
+        try:
+            requests.post(f"{self.config.aurora_config['url']}/relation/", json=relation_payload)
+        except requests.RequestException as e:
+            self.log.error(
+                f"Post request to relation failed with {e}. \nRelation payload: {relation_payload}"
+            )
+
+    def get_sample_minhash(self, sha256: str, minhash_type: str) -> Dict[str, Any]:
+        try:
+            r = requests.get(
+                f"{self.config.aurora_config['url']}/sample/{sha256}/minhash?minhash_type={minhash_type}"
+            )
+        except requests.RequestException as e:
+            self.log.error(
+                f"Get request for sample minhash {minhash_type} failed with {e}. \nSample: {sha256}"
+            )
+
+        return r.json()
 
     def process_ssdeep(self, task: Task) -> None:
         sha256 = task.get_payload("sha256")
         chunksize = task.get_payload("chunksize")
         ssdeep_hash = task.get_payload("ssdeep")
 
-        ssdeep_data_list = get_ssdeep_hashes(
-            self.config.aurora_config["url"], chunksize
-        )
+        ssdeep_data_list = self.get_ssdeep_hashes(chunksize)
 
         for ssdeep_data in ssdeep_data_list:
             if ssdeep_data["sample"]["sha256"] == sha256:
@@ -142,10 +141,21 @@ class Similarity(Karton):
             )
 
             if ssdeep_coefficient > 0.5:
-                post_relation(
-                    self.config.aurora_config["url"],
+                self.add_relation(
                     sha256,
                     ssdeep_data["sample"]["sha256"],
-                    "ssdeep",
                     ssdeep_coefficient,
+                    "ssdeep",
                 )
+
+    def get_ssdeep_hashes(self, chunksize: int) -> Dict[str, Any]:
+        try:
+            r = requests.get(
+                f"{self.config.aurora_config['url']}/ssdeep?chunksize={chunksize}"
+            )
+        except requests.RequestException as e:
+            self.log.error(
+                f"Get request for ssdeep hashes failed with {e}. \nChunksize: {chunksize}"
+            )
+
+        return r.json()
