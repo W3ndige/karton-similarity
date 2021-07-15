@@ -47,9 +47,7 @@ class Similarity(Karton):
 
         lsh_sha256_list = self.minhash_lsh_dict[minhash_type].query(minhash)
 
-        self.process_minhash_candidates(
-            sha256, minhash, lsh_sha256_list, minhash_type
-        )
+        self.process_minhash_candidates(sha256, minhash, lsh_sha256_list, minhash_type)
 
     def process_minhash_candidates(
         self,
@@ -88,7 +86,10 @@ class Similarity(Karton):
             storage_config={
                 "type": "redis",
                 "basename": minhash_type.encode("UTF-8"),
-                "redis": {"host": "redis", "port": 6379},
+                "redis": {
+                    "host": self.config.redis_config["host"],
+                    "port": self.config.redis_config["port"],
+                },
             },
         )
 
@@ -107,7 +108,9 @@ class Similarity(Karton):
         }
 
         try:
-            requests.post(f"{self.config.aurora_config['url']}/relation/", json=relation_payload)
+            requests.post(
+                f"{self.config.aurora_config['url']}/relation/", json=relation_payload
+            )
         except requests.RequestException as e:
             self.log.error(
                 f"Post request to relation failed with {e}. \nRelation payload: {relation_payload}"
